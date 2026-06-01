@@ -1,10 +1,11 @@
 #include <pebble.h>
 
-#define DEBUG_SIMULATION 0  // Keep at 0 to test real GPS from phone
+#define DEBUG_SIMULATION 0  
 
 #define CACHE_START_TIME_KEY 100
 #define CACHE_ELAPSED_KEY    101
 #define MAX_POINTS      1024
+#define MAX_HISTORY_ITEMS 10 
 
 typedef enum {
   VIEW_DISTANCE = 0, 
@@ -21,23 +22,29 @@ typedef struct {
   int32_t y;
 } HikePoint;
 
+typedef struct {
+  char title[32];
+  char subtitle[32];
+} HistoryItem;
+
 // ---------------------------------------------------------------------------
 // GLOBAL UI VARIABLES
 // ---------------------------------------------------------------------------
 static Window *s_start_window;
 static Window *s_main_window;
 static Window *s_finish_window;
+static Window *s_history_window; 
 
 static BitmapLayer *s_start_bitmap_layer;
 static GBitmap *s_start_bitmap;
+static TextLayer *s_start_hint_layer; 
 
 static TextLayer *s_time_layer;
 static ActionBarLayer *s_action_bar;
 static Layer *s_canvas_layer;
 
-// NEW: Start completely empty instead of saying "Waiting for phone..."
 static TextLayer *s_debug_layer;
-static char s_debug_buffer[64] = ""; 
+static char s_debug_buffer[64] = "";
 
 static GBitmap *s_switch_icon;
 static GBitmap *s_play_icon;
@@ -52,6 +59,11 @@ static TextLayer *s_finish_title_layer;
 static TextLayer *s_finish_labels[6];
 static TextLayer *s_finish_values[6];
 
+static MenuLayer *s_menu_layer;
+static TextLayer *s_loading_layer;
+static HistoryItem s_history_items[MAX_HISTORY_ITEMS];
+static int s_history_count = 0;
+
 static char s_val_time[16];
 static char s_val_dist[16];
 static char s_val_steps[16];
@@ -65,6 +77,7 @@ static char s_val_desc[16];
 static HikePoint s_points[MAX_POINTS];
 static uint16_t s_point_count = 0;
 static bool s_is_tracking = false;
+static bool s_is_replaying = false; // NEW: Replay State!
 static TopBarView s_current_view = VIEW_DISTANCE; 
 
 static int32_t s_total_meters = 0;
@@ -74,6 +87,8 @@ static int32_t s_total_descent = 0;
 
 static time_t s_trip_start_time = 0;
 static uint32_t s_cached_elapsed_time = 0;
+
+static void update_top_bar_display(struct tm *tick_time); // Forward declare
 
 // ---------------------------------------------------------------------------
 // COMMUNICATION & SENSORS
@@ -87,22 +102,53 @@ static void send_state_to_phone(int state_val) {
   }
 }
 
+static void request_history_item(int index) {
+  DictionaryIterator *iter;
+  app_message_outbox_begin(&iter);
+  if (iter) {
+    dict_write_int(iter, MESSAGE_KEY_CMD_GET_ITEM, &index, sizeof(int), true);
+    app_message_outbox_send();
+  }
+}
+
 static void in_received_handler(DictionaryIterator *iter, void *context) {
   
-  Tuple *debug_tuple = dict_find(iter, MESSAGE_KEY_KEY_DEBUG_MSG);
+  // --- HISTORY MENU HANDLERS ---
+  Tuple *count_tuple = dict_find(iter, MESSAGE_KEY_LIST_COUNT);
+  Tuple *index_tuple = dict_find(iter, MESSAGE_KEY_ITEM_INDEX);
 
-  if (debug_tuple) {
-    snprintf(s_debug_buffer, sizeof(s_debug_buffer), "%s", debug_tuple->value->cstring);
-    
-    if (s_debug_layer != NULL) {
-      text_layer_set_text(s_debug_layer, s_debug_buffer);
+  if (count_tuple) {
+    s_history_count = count_tuple->value->int32;
+    if (s_history_count > 0) {
+      request_history_item(0); 
+    } else {
+      text_layer_set_text(s_loading_layer, "No history saved!");
     }
   }
 
-  if (DEBUG_SIMULATION || !s_is_tracking) return; 
+  if (index_tuple) {
+    int idx = index_tuple->value->int32;
+    Tuple *title_tuple = dict_find(iter, MESSAGE_KEY_ITEM_TITLE);
+    Tuple *sub_tuple = dict_find(iter, MESSAGE_KEY_ITEM_SUBTITLE);
 
-  Tuple *x_tuple = dict_find(iter, MESSAGE_KEY_KEY_NEW_POINT_X);
-  Tuple *y_tuple = dict_find(iter, MESSAGE_KEY_KEY_NEW_POINT_Y);
+    if (title_tuple && sub_tuple && idx < MAX_HISTORY_ITEMS) {
+      strncpy(s_history_items[idx].title, title_tuple->value->cstring, sizeof(s_history_items[idx].title) - 1);
+      s_history_items[idx].title[sizeof(s_history_items[idx].title) - 1] = '\0';
+      
+      strncpy(s_history_items[idx].subtitle, sub_tuple->value->cstring, sizeof(s_history_items[idx].subtitle) - 1);
+      s_history_items[idx].subtitle[sizeof(s_history_items[idx].subtitle) - 1] = '\0';
+
+      if (idx + 1 < s_history_count) {
+        request_history_item(idx + 1); 
+      } else {
+        layer_set_hidden(text_layer_get_layer(s_loading_layer), true);
+        layer_set_hidden(menu_layer_get_layer(s_menu_layer), false);
+        menu_layer_reload_data(s_menu_layer);
+      }
+    }
+  }
+
+  // Catch generic Stats (Used by both Live Tracking and Replay)
   Tuple *dist_tuple = dict_find(iter, MESSAGE_KEY_KEY_DISTANCE);
   Tuple *speed_tuple = dict_find(iter, MESSAGE_KEY_KEY_SPEED);
   Tuple *ascent_tuple = dict_find(iter, MESSAGE_KEY_KEY_ASCENT);
@@ -112,6 +158,47 @@ static void in_received_handler(DictionaryIterator *iter, void *context) {
   if (speed_tuple) s_current_speed = speed_tuple->value->int32;
   if (ascent_tuple) s_total_ascent = ascent_tuple->value->int32;
   if (descent_tuple) s_total_descent = descent_tuple->value->int32;
+
+  // --- REPLAY HANDLERS ---
+  Tuple *replay_start = dict_find(iter, MESSAGE_KEY_REPLAY_START);
+  if (replay_start) {
+    s_point_count = 0; // Clear the canvas!
+    Tuple *time_tup = dict_find(iter, MESSAGE_KEY_REPLAY_TIME);
+    if (time_tup) s_cached_elapsed_time = time_tup->value->int32;
+    
+    // Refresh Top Bar immediately with the final stats
+    if (s_time_layer) {
+      time_t now = time(NULL);
+      update_top_bar_display(localtime(&now));
+    }
+  }
+
+  if (s_is_replaying) {
+    Tuple *rx = dict_find(iter, MESSAGE_KEY_REPLAY_PT_X);
+    Tuple *ry = dict_find(iter, MESSAGE_KEY_REPLAY_PT_Y);
+    if (rx && ry) {
+      if (s_point_count < MAX_POINTS) {
+        s_points[s_point_count].x = rx->value->int32;
+        s_points[s_point_count].y = ry->value->int32;
+        s_point_count++;
+        if (s_canvas_layer != NULL) layer_mark_dirty(s_canvas_layer);
+      }
+    }
+    // Bypass live logic!
+    return;
+  }
+
+  // --- LIVE TRACKING HANDLERS ---
+  Tuple *debug_tuple = dict_find(iter, MESSAGE_KEY_KEY_DEBUG_MSG);
+  if (debug_tuple) {
+    snprintf(s_debug_buffer, sizeof(s_debug_buffer), "%s", debug_tuple->value->cstring);
+    if (s_debug_layer != NULL) text_layer_set_text(s_debug_layer, s_debug_buffer);
+  }
+
+  if (DEBUG_SIMULATION || !s_is_tracking) return; 
+
+  Tuple *x_tuple = dict_find(iter, MESSAGE_KEY_KEY_NEW_POINT_X);
+  Tuple *y_tuple = dict_find(iter, MESSAGE_KEY_KEY_NEW_POINT_Y);
 
   if (s_total_meters >= 100000) {
     if (s_is_tracking) {
@@ -134,9 +221,7 @@ static void in_received_handler(DictionaryIterator *iter, void *context) {
     s_points[s_point_count].y = y_tuple->value->int32;
     s_point_count++;
     
-    if (s_canvas_layer != NULL) {
-      layer_mark_dirty(s_canvas_layer);
-    }
+    if (s_canvas_layer != NULL) layer_mark_dirty(s_canvas_layer);
   }
 }
 
@@ -145,12 +230,72 @@ static void compass_handler(CompassHeadingData heading_data) {
   if (DEBUG_SIMULATION || heading_data.compass_status == CompassStatusDataInvalid) return;
   s_current_heading_index = ((heading_data.magnetic_heading + 4096) % TRIG_MAX_ANGLE) / 8192;
   if (window_stack_get_top_window() == s_main_window) {
-    if (s_canvas_layer != NULL) {
-      layer_mark_dirty(s_canvas_layer);
-    }
+    if (s_canvas_layer != NULL) layer_mark_dirty(s_canvas_layer);
   }
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// HISTORY SCREEN (MENU)
+// ---------------------------------------------------------------------------
+static uint16_t menu_get_num_rows_callback(MenuLayer *menu_layer, uint16_t section_index, void *data) {
+  return s_history_count;
+}
+
+static void menu_draw_row_callback(GContext* ctx, const Layer *cell_layer, MenuIndex *cell_index, void *data) {
+  menu_cell_basic_draw(ctx, cell_layer, s_history_items[cell_index->row].title, s_history_items[cell_index->row].subtitle, NULL);
+}
+
+static void menu_select_callback(MenuLayer *menu_layer, MenuIndex *cell_index, void *data) {
+  int index = cell_index->row;
+  
+  // Ask phone to stream this specific hike
+  DictionaryIterator *iter;
+  app_message_outbox_begin(&iter);
+  if (iter) {
+    dict_write_int(iter, MESSAGE_KEY_CMD_GET_HIKE, &index, sizeof(int), true);
+    app_message_outbox_send();
+  }
+
+  // Pre-configure the main window for Replay mode
+  s_is_replaying = true;
+  s_point_count = 0;
+  s_total_meters = 0;
+  s_cached_elapsed_time = 0;
+  s_total_ascent = 0;
+  s_total_descent = 0;
+  s_current_speed = 0;
+  
+  window_stack_push(s_main_window, true);
+}
+
+static void history_window_load(Window *window) {
+  Layer *window_layer = window_get_root_layer(window);
+  GRect bounds = layer_get_bounds(window_layer);
+
+  s_loading_layer = text_layer_create(GRect(0, bounds.size.h / 2 - 10, bounds.size.w, 20));
+  text_layer_set_text_alignment(s_loading_layer, GTextAlignmentCenter);
+  text_layer_set_text(s_loading_layer, "Loading History...");
+  text_layer_set_text_color(s_loading_layer, GColorWhite);
+  text_layer_set_background_color(s_loading_layer, GColorClear);
+  layer_add_child(window_layer, text_layer_get_layer(s_loading_layer));
+
+  s_menu_layer = menu_layer_create(bounds);
+  menu_layer_set_callbacks(s_menu_layer, NULL, (MenuLayerCallbacks){
+    .get_num_rows = menu_get_num_rows_callback,
+    .draw_row = menu_draw_row_callback,
+    .select_click = menu_select_callback,
+  });
+  menu_layer_set_click_config_onto_window(s_menu_layer, window);
+  
+  layer_set_hidden(menu_layer_get_layer(s_menu_layer), true); 
+  layer_add_child(window_layer, menu_layer_get_layer(s_menu_layer));
+}
+
+static void history_window_unload(Window *window) {
+  text_layer_destroy(s_loading_layer);
+  menu_layer_destroy(s_menu_layer);
+}
 
 // ---------------------------------------------------------------------------
 // FINISH SCREEN (SUMMARY)
@@ -177,7 +322,7 @@ static void finish_window_load(Window *window) {
   layer_add_child(window_layer, scroll_layer_get_layer(s_finish_scroll_layer));
 
   s_finish_title_layer = text_layer_create(GRect(10, 10, bounds.size.w - 20, 35));
-  text_layer_set_text(s_finish_title_layer, "Well done!");
+  text_layer_set_text(s_finish_title_layer, s_is_replaying ? "Hike Summary" : "Well done!");
   text_layer_set_font(s_finish_title_layer, fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD));
   text_layer_set_text_color(s_finish_title_layer, GColorWhite);
   text_layer_set_background_color(s_finish_title_layer, GColorClear);
@@ -272,7 +417,7 @@ static void update_top_bar_display(struct tm *tick_time) {
     }
     case VIEW_DURATION: {
       uint32_t display_time = s_cached_elapsed_time;
-      if (s_is_tracking && s_trip_start_time > 0) {
+      if (s_is_tracking && s_trip_start_time > 0 && !s_is_replaying) {
         display_time += (time(NULL) - s_trip_start_time);
       }
       uint32_t hrs = display_time / 3600;
@@ -305,28 +450,26 @@ static void update_top_bar_display(struct tm *tick_time) {
     text_layer_set_text(s_time_layer, s_metric_buffer);
   }
 
-  // Toggle debug text visibility based on view
   if (s_debug_layer != NULL) {
-    layer_set_hidden(text_layer_get_layer(s_debug_layer), s_current_view != VIEW_DISTANCE);
+    // Hide debug layer if we are not on distance view OR if we are replaying
+    bool should_hide = (s_current_view != VIEW_DISTANCE) || s_is_replaying;
+    layer_set_hidden(text_layer_get_layer(s_debug_layer), should_hide);
   }
 }
 
 static void canvas_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 
-  // Debug outline drawing the exact boundary of the canvas layer area
   graphics_context_set_stroke_color(ctx, GColorWhite);
   graphics_context_set_stroke_width(ctx, 1);
   graphics_draw_rect(ctx, bounds);
 
   if (s_point_count == 0) {
-    // If we haven't received any coordinates yet, just draw a dot in the absolute center
     graphics_context_set_fill_color(ctx, GColorWhite);
     graphics_fill_circle(ctx, GPoint(bounds.size.w / 2, bounds.size.h / 2), 3);
     return;
   }
 
-  // 1. Find the Bounding Box of all recorded GPS points
   int32_t min_x = s_points[0].x;
   int32_t max_x = s_points[0].x;
   int32_t min_y = s_points[0].y;
@@ -339,8 +482,6 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
     if (s_points[i].y > max_y) max_y = s_points[i].y;
   }
 
-  // 2. Enforce a Minimum Viewport size to prevent extreme zooming/jumping initially
-  // Forces the map to show at least a 50x50 meter area at all times
   int32_t data_w = max_x - min_x;
   int32_t data_h = max_y - min_y;
 
@@ -355,22 +496,18 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
     data_h = 50;
   }
 
-  // 3. Find the center point of our actual data bounds
   int32_t data_cx = min_x + (data_w / 2);
   int32_t data_cy = min_y + (data_h / 2);
 
-  // 4. Set our Screen target bounds (The 8px inset requested)
   int16_t avail_w = bounds.size.w - 16; 
   int16_t avail_h = bounds.size.h - 16;
   int16_t screen_cx = bounds.size.w / 2;
   int16_t screen_cy = bounds.size.h / 2;
 
-  // 5. Calculate Zoom Scale (Multiplied by 1024 for integer-safe precision)
   int32_t zoom_x = (avail_w * 1024) / data_w;
   int32_t zoom_y = (avail_h * 1024) / data_h;
-  int32_t zoom_scale = (zoom_x < zoom_y) ? zoom_x : zoom_y; // Take the smaller zoom to fit both axes
+  int32_t zoom_scale = (zoom_x < zoom_y) ? zoom_x : zoom_y; 
 
-  // 6. Draw the Path
   graphics_context_set_stroke_width(ctx, 2);
   graphics_context_set_stroke_color(ctx, GColorWhite);
 
@@ -378,13 +515,11 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
   GPoint curr_pixel = GPoint(0, 0);
   
   for (uint16_t i = 0; i < s_point_count; i++) {
-    // Shift point relative to the data center, apply the zoom, then position it on the screen center
     int16_t px = screen_cx + (((s_points[i].x - data_cx) * zoom_scale) >> 10);
-    int16_t py = screen_cy - (((s_points[i].y - data_cy) * zoom_scale) >> 10); // Y is inverted on screen
+    int16_t py = screen_cy - (((s_points[i].y - data_cy) * zoom_scale) >> 10); 
     curr_pixel = GPoint(px, py);
     
     if (i == 0) {
-      // Draw Start Point indicator (Solid Dot)
       graphics_context_set_fill_color(ctx, GColorWhite);
       graphics_fill_circle(ctx, curr_pixel, 3);
     } else {
@@ -393,7 +528,6 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
     prev_pixel = curr_pixel;
   }
 
-  // 7. Draw the Current Location Compass at the final loop pixel
   GBitmap *ptr_bmp = s_ptr_bitmaps[s_current_heading_index];
   if (ptr_bmp) {
     GRect bmp_bounds = gbitmap_get_bounds(ptr_bmp);
@@ -412,6 +546,8 @@ static void up_click_handler(ClickRecognizerRef recognizer, void *context) {
 }
 
 static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
+  if (s_is_replaying) return; // Disable pausing during replay!
+  
   s_is_tracking = !s_is_tracking;
   if (s_is_tracking) {
     action_bar_layer_set_icon(s_action_bar, BUTTON_ID_SELECT, s_pause_icon);
@@ -427,6 +563,11 @@ static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
 }
 
 static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
+  if (s_is_replaying) {
+    window_stack_push(s_finish_window, true);
+    return;
+  }
+
   if (s_is_tracking) {
     s_cached_elapsed_time += (time(NULL) - s_trip_start_time);
   }
@@ -516,7 +657,9 @@ static void main_window_load(Window *window) {
   s_ptr_bitmaps[7] = gbitmap_create_with_resource(RESOURCE_ID_IMAGE_PTR_NW);
 
   action_bar_layer_set_icon(s_action_bar, BUTTON_ID_UP, s_switch_icon);
-  action_bar_layer_set_icon(s_action_bar, BUTTON_ID_SELECT, s_pause_icon);
+  
+  // Disable the Start/Pause icon visually if we are just replaying a hike
+  action_bar_layer_set_icon(s_action_bar, BUTTON_ID_SELECT, s_is_replaying ? NULL : s_pause_icon);
   action_bar_layer_set_icon(s_action_bar, BUTTON_ID_DOWN, s_finish_icon);
 
   int available_width = bounds.size.w - ACTION_BAR_WIDTH;
@@ -528,12 +671,10 @@ static void main_window_load(Window *window) {
   text_layer_set_background_color(s_time_layer, GColorClear);
   layer_add_child(window_layer, text_layer_get_layer(s_time_layer));
 
-  // Expanded the map drawing area exactly to 116px (available_width + 2)
   s_canvas_layer = layer_create(GRect(0, 20, available_width + 2, bounds.size.h - 20));
   layer_set_update_proc(s_canvas_layer, canvas_update_proc);
   layer_add_child(window_layer, s_canvas_layer);
 
-  // Expanded the width by 1px more (available_width + 2) to push the right-aligned text exactly 1px to the right
   s_debug_layer = text_layer_create(GRect(0, 4, available_width + 2, 20));
   text_layer_set_text_alignment(s_debug_layer, GTextAlignmentRight);
   text_layer_set_font(s_debug_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
@@ -581,6 +722,7 @@ static void main_window_unload(Window *window) {
 // START SCREEN (HOME)
 // ---------------------------------------------------------------------------
 static void start_select_click_handler(ClickRecognizerRef recognizer, void *context) {
+  s_is_replaying = false; // Reset replay state
   s_point_count = 0;
   s_total_meters = 0;
   s_current_speed = 0;
@@ -601,8 +743,21 @@ static void start_select_click_handler(ClickRecognizerRef recognizer, void *cont
   window_stack_push(s_main_window, true);
 }
 
+static void start_down_click_handler(ClickRecognizerRef recognizer, void *context) {
+  window_stack_push(s_history_window, true);
+  
+  DictionaryIterator *iter;
+  app_message_outbox_begin(&iter);
+  if (iter) {
+    int dummy = 1;
+    dict_write_int(iter, MESSAGE_KEY_CMD_GET_COUNT, &dummy, sizeof(int), true);
+    app_message_outbox_send();
+  }
+}
+
 static void start_click_config_provider(void *context) {
   window_single_click_subscribe(BUTTON_ID_SELECT, start_select_click_handler);
+  window_single_click_subscribe(BUTTON_ID_DOWN, start_down_click_handler); 
 }
 
 static void start_window_load(Window *window) {
@@ -617,9 +772,17 @@ static void start_window_load(Window *window) {
   bitmap_layer_set_bitmap(s_start_bitmap_layer, s_start_bitmap);
   bitmap_layer_set_alignment(s_start_bitmap_layer, GAlignCenter);
   layer_add_child(window_layer, bitmap_layer_get_layer(s_start_bitmap_layer));
+
+  s_start_hint_layer = text_layer_create(GRect(0, bounds.size.h - 20, bounds.size.w - 5, 20));
+  text_layer_set_text(s_start_hint_layer, "History ->");
+  text_layer_set_text_alignment(s_start_hint_layer, GTextAlignmentRight);
+  text_layer_set_background_color(s_start_hint_layer, GColorClear);
+  text_layer_set_text_color(s_start_hint_layer, GColorWhite);
+  layer_add_child(window_layer, text_layer_get_layer(s_start_hint_layer));
 }
 
 static void start_window_unload(Window *window) {
+  text_layer_destroy(s_start_hint_layer);
   bitmap_layer_destroy(s_start_bitmap_layer);
   gbitmap_destroy(s_start_bitmap);
 }
@@ -653,6 +816,12 @@ static void init() {
     .unload = finish_window_unload
   });
 
+  s_history_window = window_create();
+  window_set_window_handlers(s_history_window, (WindowHandlers) {
+    .load = history_window_load,
+    .unload = history_window_unload
+  });
+
   window_stack_push(s_start_window, true);
   
   tick_timer_service_subscribe(SECOND_UNIT, tick_handler);
@@ -665,6 +834,7 @@ static void deinit() {
   window_destroy(s_start_window);
   window_destroy(s_main_window);
   window_destroy(s_finish_window);
+  window_destroy(s_history_window);
 }
 
 int main(void) {

@@ -20,7 +20,18 @@
             "KEY_DEBUG_MSG",
             "REQUEST_LOCATION",
             "LATITUDE",
-            "LONGITUDE"
+            "LONGITUDE",
+            "CMD_GET_COUNT",
+            "LIST_COUNT",
+            "CMD_GET_ITEM",
+            "ITEM_INDEX",
+            "ITEM_TITLE",
+            "ITEM_SUBTITLE",
+            "CMD_GET_HIKE",
+            "REPLAY_START",
+            "REPLAY_TIME",
+            "REPLAY_PT_X",
+            "REPLAY_PT_Y"
         ],
         "projectType": "native",
         "resources": {
