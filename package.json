@@ -1,0 +1,118 @@
+{
+    "author": "florian.knoedl.9@gmail.com",
+    "dependencies": {},
+    "keywords": [],
+    "name": "hiker",
+    "pebble": {
+        "capabilities": [
+            "location"
+        ],
+        "displayName": "Hiker",
+        "enableMultiJS": true,
+        "messageKeys": [
+            "KEY_STATE",
+            "KEY_NEW_POINT_X",
+            "KEY_NEW_POINT_Y",
+            "KEY_DISTANCE",
+            "KEY_SPEED",
+            "KEY_ASCENT",
+            "KEY_DESCENT",
+            "KEY_DEBUG_MSG",
+            "REQUEST_LOCATION",
+            "LATITUDE",
+            "LONGITUDE"
+        ],
+        "projectType": "native",
+        "resources": {
+            "media": [
+                {
+                    "file": "images/Fin.png",
+                    "name": "IMAGE_FINISH",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/Play.png",
+                    "name": "IMAGE_PLAY",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/Pause.png",
+                    "name": "IMAGE_PAUSE",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/Switch.png",
+                    "name": "IMAGE_SWITCH",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/pointer-up.png",
+                    "name": "IMAGE_PTR_N",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/pointer-right.png",
+                    "name": "IMAGE_PTR_E",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/pointer-left.png",
+                    "name": "IMAGE_PTR_W",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/pointer-down.png",
+                    "name": "IMAGE_PTR_S",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/pointer-up-right.png",
+                    "name": "IMAGE_PTR_NE",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/pointer-down-right.png",
+                    "name": "IMAGE_PTR_SE",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/pointer-down-left.png",
+                    "name": "IMAGE_PTR_SW",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/pointer-up-left.png",
+                    "name": "IMAGE_PTR_NW",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/Startscreen-v2.png",
+                    "name": "IMAGE_STARTSCREEN",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                }
+            ]
+        },
+        "sdkVersion": "3",
+        "targetPlatforms": [
+            "flint"
+        ],
+        "uuid": "20b4a137-a0e6-4c1b-a82a-9cf6b25078eb",
+        "watchapp": {
+            "watchface": false
+        }
+    },
+    "version": "1.0.0"
+}
